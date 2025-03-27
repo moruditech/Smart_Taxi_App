@@ -1,12 +1,11 @@
-const express = require('express');
+const express = require("express");
 const router = express.Router();
-const rideRequestController = require('../controllers/rideRequestController');
 const { protect } = require("../middlewares/authMiddleware");
+const rideRequestController = require("../controllers/rideRequestController");
 
-router.post('/request', protect, rideRequestController.requestRide);
-router.patch('/accept', protect, rideRequestController.acceptRide);
-router.patch('/complete', protect, rideRequestController.completeRide);
-router.get('/history', protect, rideRequestController.getRideHistory);
-router.patch('/cancel', protect, rideRequestController.cancelRide);
+// Create a new ride or pickup request (passenger endpoint)
+router.post("/pickup", protect, rideRequestController.createPickupRequest);
+
+router.post("/ride", protect, rideRequestController.createRideRequest);
 
 module.exports = router;

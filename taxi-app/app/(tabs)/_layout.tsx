@@ -6,6 +6,9 @@ import ProfileScreen from './Profile';
 import { View, Text } from 'react-native';
 import { useAuth } from '../context/authContext';
 import ViewTaxi from './ViewTaxi';
+import RideRequestScreen from './rideRequest';
+import TaxiManagementScreen from './taxiManagement';
+import LiveChatScreen from './LiveChat';
 
 const Stack = createStackNavigator();
 
@@ -27,7 +30,7 @@ export default function TabLayout() {
           <Stack.Screen
             name="Home"
             component={Home}
-            options={{ headerShown: false, gestureEnabled: false }}
+            options={{ headerShown: false }}
           />
           <Stack.Screen
             name="Profile"
@@ -39,6 +42,21 @@ export default function TabLayout() {
           component={ViewTaxi}
           options={{headerShown: false}}
           />  
+          <Stack.Screen
+           name="requestRide"
+           component={RideRequestScreen}
+           options={{headerShown: false}}
+          />
+          <Stack.Screen
+          name='TaxiManagement'
+          component={TaxiManagementScreen}
+          options={{headerShown: false}}
+          />
+          <Stack.Screen
+            name="LiveChat"
+            component={LiveChatScreen}
+            options={{headerShown: false}}
+            />
         </>
       ) : (
         <Stack.Screen

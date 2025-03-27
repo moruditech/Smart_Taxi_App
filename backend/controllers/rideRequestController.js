@@ -1,181 +1,195 @@
-const RideRequest = require('../models/RideRequest');
-const Taxi = require('../models/Taxi');
-const { getConnectedDrivers } = require('../socket'); // Import getConnectedDrivers
+const RideRequest = require("../models/RideRequest");
+const Route = require("../models/Route");
+const Taxi = require("../models/Taxi")
+const { getIo, getConnectedDrivers } = require("../socket");
 
-exports.requestRide = async (req, res) => {
+exports.createRideRequest = async (req, res) => {
   try {
-    const { pickupLocation, dropoffLocation } = req.body;
-    const passengerId = req.user.id;
+    const passenger = req.user._id;
+    const { startingStop, destinationStop } = req.body;
 
-    const nearestTaxi = await Taxi.findOne({ status: 'roaming' }).sort({ updatedAt: 1 });
-
-    if (!nearestTaxi) {
-      return res.status(400).json({ message: 'No available roaming taxis' });
-    }
-
-    const rideRequest = new RideRequest({
-      passengerId,
-      assignedTaxiId: nearestTaxi._id,
-      assignedBy: 'system',
-      status: 'assigned',
-      pickupLocation,
-      dropoffLocation,
-    });
-
-    await rideRequest.save();
-
-    nearestTaxi.status = 'en route';
-    await nearestTaxi.save();
-
-    // Notify the assigned driver in real-time
-    const connectedDrivers = getConnectedDrivers();  // Get the current list of connected drivers
-    const driverSocketId = connectedDrivers.get(nearestTaxi.driverId);
-    
-    if (driverSocketId) {
-      io.to(driverSocketId).emit('rideRequest', {
-        rideRequestId: rideRequest._id,
-        pickupLocation,
-        dropoffLocation,
+    if (!startingStop || !destinationStop) {
+      return res.status(400).json({
+        error: "Both starting and destination stops are required for a ride request.",
       });
     }
 
-    res.status(201).json({ message: 'Ride request created', rideRequest });
-  } catch (error) {
-    res.status(500).json({ message: 'Server error', error });
+    const route = await Route.findOne({
+      "stops.name": { $all: [startingStop, destinationStop] },
+    });
+
+    if (!route) {
+      return res.status(404).json({ error: "No route found containing both stops." });
+    }
+
+    const startStopObj = route.stops.find((s) => s.name === startingStop);
+    const destStopObj = route.stops.find((s) => s.name === destinationStop);
+
+    if (!startStopObj || !destStopObj || startStopObj.order >= destStopObj.order) {
+      return res.status(400).json({ error: "Invalid stop order for ride request." });
+    }
+
+    const newRideRequest = new RideRequest({
+      passenger,
+      route: route._id,
+      requestType: "ride",
+      startingStop,
+      destinationStop,
+    });
+
+    await newRideRequest.save();
+
+    const taxisOnRoute = await Taxi.find({ routeId: route._id, status: "on trip" });
+    const eligibleTaxis = taxisOnRoute.filter((taxi) => {
+      const taxiStop = route.stops.find((s) => s.name === taxi.currentStop);
+      return taxiStop && taxiStop.order < startStopObj.order;
+    });
+
+    // **Emit notification to connected drivers**
+    const io = getIo();
+    const connectedDrivers = getConnectedDrivers();
+    
+    eligibleTaxis.forEach((taxi) => {
+      if (connectedDrivers.has(taxi.driverId.toString())) {
+        io.to(connectedDrivers.get(taxi.driverId.toString())).emit("newRideRequest", {
+          requestId: newRideRequest._id,
+          startingStop,
+          destinationStop,
+          route: route.name,
+        });
+      }
+    });
+
+    return res.status(201).json({ rideRequest: newRideRequest, route, eligibleTaxis });
+  } catch (err) {
+    console.error("Error in createRideRequest:", err);
+    return res.status(500).json({ error: "Server error." });
   }
 };
 
+exports.acceptRequest = async (req, res) => {
+  try {
+    const driverId = req.user._id;
+    const { requestId } = req.params;
 
-exports.acceptRide = async (req, res) => {
-    try {
-      const { rideRequestId } = req.body;
-      const driverId = req.user.id;
-  
-      const rideRequest = await RideRequest.findById(rideRequestId);
-      if (!rideRequest || rideRequest.status !== 'assigned') {
-        return res.status(400).json({ message: 'Invalid ride request' });
-      }
-  
-      rideRequest.status = 'accepted';
-      await rideRequest.save();
-  
-      // Notify the passenger that the driver accepted the ride
-      io.emit(`rideAccepted-${rideRequest.passengerId}`, {
-        message: 'Your ride request has been accepted!',
-        driverId,
-        rideRequestId,
-      });
-  
-      res.status(200).json({ message: 'Ride accepted', rideRequest });
-    } catch (error) {
-      res.status(500).json({ message: 'Server error', error });
+    const rideRequest = await RideRequest.findById(requestId).populate("route");
+    if (!rideRequest) {
+      return res.status(404).json({ error: "Ride request not found." });
     }
-  };
 
-  exports.completeRide = async (req, res) => {
-    try {
-      const { rideRequestId } = req.body;
-      const driverId = req.user.id;
-  
-      const rideRequest = await RideRequest.findById(rideRequestId);
-      if (!rideRequest || rideRequest.status !== 'accepted') {
-        return res.status(400).json({ message: 'Invalid or already completed ride' });
+    if (rideRequest.status !== "pending") {
+      return res.status(400).json({ error: "Request is no longer pending." });
+    }
+
+    const taxi = await Taxi.findOne({ driverId: driverId });
+    if (!taxi) {
+      return res.status(404).json({ error: "Taxi for this driver not found." });
+    }
+
+    if (String(taxi.routeId) !== String(rideRequest.route._id)) {
+      return res.status(400).json({ error: "Taxi is not on the correct route." });
+    }
+
+    if (rideRequest.requestType === "ride") {
+      if (taxi.status !== "on trip") {
+        return res.status(400).json({ error: "Taxi is not available for ride requests." });
       }
-  
-      // Verify that the driver completing the ride is the one assigned
-      const taxi = await Taxi.findOne({ _id: rideRequest.taxiId, driverId });
-      if (!taxi) {
-        return res.status(403).json({ message: 'Unauthorized: You are not assigned to this ride' });
+
+      const taxiStop = rideRequest.route.stops.find((s) => s.name === taxi.currentStop);
+      const passengerStop = rideRequest.route.stops.find((s) => s.name === rideRequest.startingStop);
+
+      if (!taxiStop || !passengerStop) {
+        return res.status(400).json({ error: "Invalid route stops data." });
       }
-  
-      rideRequest.status = 'completed';
-      await rideRequest.save();
-  
-      // Mark taxi as available again
-      taxi.status = 'available';
+
+      if (taxiStop.order >= passengerStop.order) {
+        return res.status(400).json({ error: "Taxi has already passed the passenger's starting stop." });
+      }
+    } else if (rideRequest.requestType === "pickup") {
+      if (taxi.status !== "roaming") {
+        return res.status(400).json({ error: "Taxi is not available for pickup requests." });
+      }
+      taxi.status = "on trip"; // Update taxi status
       await taxi.save();
-  
-      // Notify the passenger in real-time
-      io.emit(`rideCompleted-${rideRequest.passengerId}`, {
-        message: 'Your ride has been completed!',
-        rideRequestId,
-      });
-  
-      res.status(200).json({ message: 'Ride completed successfully', rideRequest });
-    } catch (error) {
-      res.status(500).json({ message: 'Server error', error });
+    } else {
+      return res.status(400).json({ error: "Unsupported request type." });
     }
-  };
-  
-  exports.getRideHistory = async (req, res) => {
-    try {
-      const passengerId = req.user.id;
-  
-      const rides = await RideRequest.find({ passengerId })
-        .populate('taxiId', 'numberPlate routeName')
-        .sort({ createdAt: -1 });
-  
-      res.status(200).json({ rides });
-    } catch (error) {
-      res.status(500).json({ message: 'Server error', error });
+
+    rideRequest.status = "accepted";
+    rideRequest.taxi = taxi._id;
+    await rideRequest.save();
+
+    // **Emit notification to the passenger**
+    const io = getIo();
+    io.to(rideRequest.passenger.toString()).emit("requestAccepted", {
+      requestId: rideRequest._id,
+      driverId: driverId,
+      taxi: taxi._id,
+      message: "Your ride request has been accepted!",
+    });
+
+    return res.status(200).json({ message: "Request accepted.", rideRequest });
+  } catch (err) {
+    console.error("Error in acceptRequest:", err);
+    return res.status(500).json({ error: "Server error." });
+  }
+};
+
+/**
+ * Retrieve all requests made by the authenticated passenger
+ * where:
+ * - The starting stop is either the current stop or one stop ahead.
+ * - The destination stop exists in the taxi route's stops.
+ *
+ * Expects two query parameters:
+ * - currentStop: the name of the passenger's current stop.
+ * - routeId: the ID of the route the passenger is on.
+ */
+exports.getNearbyRequests = async (req, res) => {
+  try {
+    const passengerId = req.user._id;
+    const { currentStop, routeId } = req.query;
+
+    if (!currentStop || !routeId) {
+      return res.status(400).json({ error: "Both currentStop and routeId are required." });
     }
-  };
-  
-  exports.cancelRide = async (req, res) => {
-    try {
-      const { rideRequestId } = req.body;
-      const userId = req.user.id;
-      const userRole = req.user.role; // Assuming role is included in authentication middleware
-  
-      const rideRequest = await RideRequest.findById(rideRequestId);
-      if (!rideRequest || rideRequest.status !== 'pending') {
-        return res.status(400).json({ message: 'Invalid or already processed ride request' });
-      }
-  
-      if (userRole === 'passenger' && rideRequest.passengerId.toString() !== userId) {
-        return res.status(403).json({ message: 'Unauthorized: This is not your ride request' });
-      }
-  
-      if (userRole === 'driver') {
-        const taxi = await Taxi.findById(rideRequest.taxiId);
-        if (!taxi || taxi.driverId.toString() !== userId) {
-          return res.status(403).json({ message: 'Unauthorized: You are not assigned to this ride' });
-        }
-      }
-  
-      // Mark ride as cancelled
-      rideRequest.status = 'cancelled';
-      await rideRequest.save();
-  
-      // Notify the other party in real-time
-      if (userRole === 'passenger') {
-        io.emit(`rideCancelled-${rideRequest.taxiId}`, {
-          message: 'The passenger has cancelled the ride.',
-          rideRequestId,
-        });
-      } else {
-        io.emit(`rideCancelled-${rideRequest.passengerId}`, {
-          message: 'The driver has cancelled the ride.',
-          rideRequestId,
-        });
-  
-        // Auto-assign a new taxi to the passenger if a driver cancels
-        const availableTaxi = await Taxi.findOne({ status: 'available' });
-        if (availableTaxi) {
-          rideRequest.taxiId = availableTaxi._id;
-          rideRequest.status = 'pending';
-          await rideRequest.save();
-  
-          io.emit(`rideReassigned-${rideRequest.passengerId}`, {
-            message: 'Your ride has been reassigned to a new taxi.',
-            rideRequestId,
-          });
-        }
-      }
-  
-      res.status(200).json({ message: 'Ride cancelled successfully', rideRequest });
-    } catch (error) {
-      res.status(500).json({ message: 'Server error', error });
+
+    // Retrieve the route details.
+    const route = await Route.findById(routeId);
+    if (!route) {
+      return res.status(404).json({ error: "Route not found." });
     }
-  };
-  
+
+    // Find the current stop object to get its order.
+    const currentStopObj = route.stops.find(s => s.name === currentStop);
+    if (!currentStopObj) {
+      return res.status(400).json({ error: "Invalid current stop provided." });
+    }
+    const currentOrder = currentStopObj.order;
+
+    // Retrieve all ride requests for the passenger on this route.
+    const rideRequests = await RideRequest.find({
+      passenger: passengerId,
+      route: routeId
+    }).populate("route");
+
+    // Filter the requests:
+    // - Check that startingStop is either the current stop or one stop ahead.
+    // - Check that the destinationStop is among the stops of the taxi route.
+    const nearbyRequests = rideRequests.filter(request => {
+      const requestStartStop = route.stops.find(s => s.name === request.startingStop);
+      const requestDestStop = route.stops.find(s => s.name === request.destinationStop);
+
+      // If either the startingStop or destinationStop is not valid in the route, skip the request.
+      if (!requestStartStop || !requestDestStop) return false;
+
+      // Only include requests where startingStop order is current or next.
+      return requestStartStop.order === currentOrder || requestStartStop.order === currentOrder + 1;
+    });
+
+    return res.status(200).json({ rideRequests: nearbyRequests });
+  } catch (err) {
+    console.error("Error in getNearbyRequests:", err);
+    return res.status(500).json({ error: "Server error." });
+  }
+};
